@@ -6,14 +6,13 @@ use std::sync::{
 };
 use windows::Win32::{
     Devices::Display::GUID_DEVINTERFACE_MONITOR,
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    System::LibraryLoader::{GetProcAddress, LoadLibraryW},
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GetMessageW,
-        PostMessageW, PostQuitMessage, RegisterClassW, RegisterDeviceNotificationW, SendMessageW,
-        TranslateMessage, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
-        DEV_BROADCAST_DEVICEINTERFACE_W, HWND_TOPMOST, MSG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-        WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATEAPP, WM_COMMAND, WM_COPYDATA, WM_DESTROY,
-        WM_USER, WNDCLASSW,
+        PostQuitMessage, RegisterClassW, RegisterDeviceNotificationW, TranslateMessage,
+        DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE, DEV_BROADCAST_DEVICEINTERFACE_W,
+        MSG, WINDOW_STYLE, WM_DESTROY, WNDCLASSW, WS_EX_TOPMOST,
     },
 };
 
@@ -33,10 +32,6 @@ lazy_static! {
 
 pub static BACKGROUND_HWND: AtomicIsize = AtomicIsize::new(0);
 
-fn should_forward_message(msg: u32) -> bool {
-    msg == WM_COPYDATA || msg == WM_ACTIVATEAPP || msg == WM_COMMAND || msg >= WM_USER
-}
-
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     msg: u32,
@@ -52,27 +47,13 @@ unsafe extern "system" fn window_proc(
         log_error!(callback(msg, w_param.0, l_param.0));
     }
 
-    // Forwards a message to the real tray window.
-    if should_forward_message(msg) {
-        let Ok(real_tray) = get_native_shell_hwnd() else {
-            return DefWindowProcW(hwnd, msg, w_param, l_param);
-        };
-
-        return if msg > WM_USER {
-            let _ = PostMessageW(Some(real_tray), msg, w_param, l_param);
-            DefWindowProcW(hwnd, msg, w_param, l_param)
-        } else {
-            SendMessageW(real_tray, msg, Some(w_param), Some(l_param))
-        };
-    }
-
     DefWindowProcW(hwnd, msg, w_param, l_param)
 }
 
 /// will lock until the window is closed
 unsafe fn _create_background_window(done: &crossbeam_channel::Sender<()>) -> Result<()> {
     let title = WindowsString::from("Seelen UI Background Window");
-    let class = WindowsString::from("Shell_TrayWnd"); // interset native shell messages
+    let class = WindowsString::from("SeelenUIShell");
 
     let h_module = WindowsApi::module_handle_w()?;
 
@@ -86,7 +67,7 @@ unsafe fn _create_background_window(done: &crossbeam_channel::Sender<()>) -> Res
     RegisterClassW(&wnd_class);
 
     let hwnd = CreateWindowExW(
-        WINDOW_EX_STYLE::default(),
+        WS_EX_TOPMOST,
         class.as_pcwstr(),
         title.as_pcwstr(),
         WINDOW_STYLE::default(),
@@ -102,16 +83,6 @@ unsafe fn _create_background_window(done: &crossbeam_channel::Sender<()>) -> Res
 
     let handle: isize = hwnd.0 as isize;
     BACKGROUND_HWND.store(handle, Ordering::Relaxed);
-    // keep the window on top
-    std::thread::spawn(move || loop {
-        let _ = WindowsApi::set_position(
-            HWND(handle as _),
-            Some(HWND_TOPMOST),
-            &RECT::default(),
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    });
 
     // register window to recieve device notifications for monitor changes
     {
@@ -139,9 +110,40 @@ unsafe fn _create_background_window(done: &crossbeam_channel::Sender<()>) -> Res
     Ok(())
 }
 
+pub unsafe fn test_dll_hook() -> Result<()> {
+    let dll_path = WindowsString::from("hook.dll");
+    let dll = LoadLibraryW(dll_path.as_pcwstr())?;
+
+    let install_hook: unsafe extern "system" fn(u32) -> bool =
+        std::mem::transmute(GetProcAddress(dll, windows_core::s!("install_hook")));
+
+    let native_shell = get_native_shell_hwnd()?;
+    let (process_id, thread_id) = WindowsApi::window_thread_process_id(native_shell);
+    log::debug!(
+        "Native shell hwnd: {:08X}, thread id: {:08X}, process id: {:08X}",
+        native_shell.0 as usize,
+        thread_id,
+        process_id
+    );
+
+    install_hook(thread_id);
+
+    let mut msg = MSG::default();
+    while GetMessageW(&mut msg, None, 0, 0).into() {
+        TranslateMessage(&msg).ok().filter_fake_error()?;
+        DispatchMessageW(&msg);
+    }
+
+    Ok(())
+}
+
 /// the objective with this window is having a thread that will receive window events
 /// and propagate them across the application (common events are keyboard, power, display, etc)
 pub fn create_background_window() -> Result<()> {
+    spawn_named_thread("DLL", || {
+        log_error!(unsafe { test_dll_hook() });
+    })?;
+
     let (tx, rx) = crossbeam_channel::bounded(1);
     spawn_named_thread("Background Window", move || {
         log::trace!("Creating background window...");
@@ -160,19 +162,9 @@ where
 }
 
 pub fn get_native_shell_hwnd() -> Result<HWND> {
-    let own_shell = BACKGROUND_HWND.load(Ordering::Acquire);
     let hwnd = unsafe {
         let class = WindowsString::from("Shell_TrayWnd");
-        FindWindowExW(
-            None,
-            if own_shell == 0 {
-                None
-            } else {
-                Some(HWND(own_shell as _))
-            },
-            class.as_pcwstr(),
-            None,
-        )?
+        FindWindowExW(None, None, class.as_pcwstr(), None)?
     };
     Ok(hwnd)
 }

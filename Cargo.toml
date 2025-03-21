@@ -20,6 +20,11 @@ path = "src/background/main.rs"
 name = "slu-service"
 path = "src/service/main.rs"
 
+[lib]
+name = "hook"
+path = "src/hook/lib.rs"
+crate-type = ["cdylib"]
+
 [profile.dev]
 debug = "full"
 strip = "symbols"
@@ -130,6 +135,7 @@ features = [
     "Win32_System_StationsAndDesktops",
     "Win32_System_RemoteDesktop",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemServices",
     "Wdk_System_Threading",                # required to get system info (NtQueryInformationProcess)
     "Wdk_System_SystemInformation",        # required to get system info (NtQuerySystemInformation)
     "Wdk_System_SystemServices",           # required to get system info (PROCESS_EXTENDED_BASIC_INFORMATION)
